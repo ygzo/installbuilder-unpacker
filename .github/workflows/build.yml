@@ -1,0 +1,208 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            arch: arm64
+            runner: macos-15
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-24.04
+          - os: windows
+            arch: arm64
+            runner: windows-11-arm
+            platform: ARM64
+            triplet: arm64-windows-static
+          - os: windows
+            arch: x86_64
+            runner: windows-2022
+            platform: x64
+            triplet: x64-windows-static
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          expected="v$(tr -d '\r\n' < VERSION)"
+          if [ "$RELEASE_TAG" != "$expected" ]; then
+            echo "Tag $RELEASE_TAG does not match VERSION ($expected)" >&2
+            exit 1
+          fi
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build zlib1g-dev liblzma-dev
+
+      - name: Check out Windows dependencies
+        if: matrix.os == 'windows'
+        uses: actions/checkout@v6
+        with:
+          repository: microsoft/vcpkg
+          ref: e456309491fd875487bf02b8a0dca76c1b1b00cc
+          path: .vcpkg
+          persist-credentials: false
+
+      - name: Bootstrap vcpkg
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & ./.vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure Unix
+        if: matrix.os != 'windows'
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+          TARGET_OS: ${{ matrix.os }}
+        run: |
+          args=(-DCMAKE_BUILD_TYPE=Release "-DIB_PACKAGE_ARCH=$PACKAGE_ARCH")
+          if [ "$TARGET_OS" = macos ]; then
+            args+=("-DCMAKE_OSX_ARCHITECTURES=$PACKAGE_ARCH")
+          fi
+          cmake -S . -B build "${args[@]}"
+
+      - name: Configure Windows
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_TRIPLET: ${{ matrix.triplet }}
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          $toolchain = "$env:GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A $env:TARGET_PLATFORM "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DVCPKG_TARGET_TRIPLET=$env:TARGET_TRIPLET" "-DIB_PACKAGE_ARCH=$env:PACKAGE_ARCH"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and install
+        run: |
+          cmake --build build --config Release --parallel 4
+          cmake --install build --config Release --prefix "$PWD/stage"
+
+      - name: Check executable
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_OS: ${{ matrix.os }}
+        run: |
+          executable=stage/bin/ib-unpack
+          if [ "$TARGET_OS" = windows ]; then executable+=.exe; fi
+          expected="ib-unpack $(tr -d '\r\n' < VERSION)"
+          for flag in --version -v -V; do
+            actual=$("$executable" "$flag" | tr -d '\r')
+            [ "$actual" = "$expected" ]
+          done
+          "$executable" --help
+          # Inspect the binary header so a mislabeled architecture fails CI.
+          python_command=python3
+          if [ "$TARGET_OS" = windows ]; then python_command=python; fi
+          "$python_command" - "$executable" "$TARGET_OS" "$TARGET_ARCH" <<'PY'
+          import pathlib, struct, sys
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          os, arch = sys.argv[2:]
+          if os == 'windows':
+              offset = struct.unpack_from('<I', data, 0x3c)[0]
+              assert data[offset:offset+4] == b'PE\0\0'
+              machine = struct.unpack_from('<H', data, offset + 4)[0]
+              expected = {'x86_64': 0x8664, 'arm64': 0xaa64}[arch]
+          elif os == 'linux':
+              assert data[:5] == b'\x7fELF\x02'
+              machine = struct.unpack_from('<H', data, 18)[0]
+              expected = {'x86_64': 62, 'arm64': 183}[arch]
+          else:
+              assert data[:4] == b'\xcf\xfa\xed\xfe'
+              machine = struct.unpack_from('<I', data, 4)[0]
+              expected = {'x86_64': 0x01000007, 'arm64': 0x0100000c}[arch]
+          assert machine == expected, (hex(machine), hex(expected))
+          PY
+
+      - name: Package
+        run: cpack --config build/CPackConfig.cmake -C Release -B dist
+
+      - name: Upload package
+        uses: actions/upload-artifact@v6
+        with:
+          name: ib-unpack-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download packages and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          gh run download "$RUN_ID" --dir release-assets
+          shopt -s nullglob
+          packages=(release-assets/*/*.tar.gz release-assets/*/*.zip)
+          if [ "${#packages[@]}" -ne 6 ]; then
+            echo "Expected six platform packages, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          mkdir checksums
+          for package in "${packages[@]}"; do
+            name=$(basename "$package")
+            digest=$(sha256sum "$package" | cut -d ' ' -f 1)
+            printf '%s  %s\n' "$digest" "$name" >> checksums/SHA256SUMS
+          done
+          cat > release-notes.md <<'NOTES'
+          Native C++ InstallBuilder unpacker. Extracts installers without running them.
+
+          Includes a terminal progress bar and parallel payload decompression. Use `--no-progress` to hide the bar.
+
+          Includes macOS, Linux, and Windows binaries for arm64 and x86_64. Download the archive for your platform and architecture; the executable is in `bin/`.
+
+          Supports ZIP, LZMA, LZHAM, password-protected payloads, split files, and symlinks. Nonempty Ultra payloads still need compatibility testing. On Windows, symlink extraction requires Developer Mode or administrator rights.
+
+          The app is MIT-licensed. Dependency license notices are included in each package. `SHA256SUMS` lists package checksums.
+          NOTES
+          gh release create "$RELEASE_TAG" "${packages[@]}" checksums/SHA256SUMS --verify-tag --title "ib-unpack $RELEASE_TAG" --notes-file release-notes.md

@@ -1,0 +1,2 @@
+#pragma once
+#define IB_VERSION "@PROJECT_VERSION@"
